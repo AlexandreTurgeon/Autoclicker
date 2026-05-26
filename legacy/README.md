@@ -59,6 +59,8 @@ Close the window to quit. Your points, interval, jitter, and hotkey bindings are
 
 Both can be rebound from the window — click **Rebind** next to either key, then press the key you want. Press **Esc** to cancel. The new binding is saved to `autoclicker.ini` and used on the next launch.
 
+Only non-typing keys are bindable: **F1–F24**, arrow keys, **Insert / Delete / Home / End / Page Up / Page Down**, **Print Screen**, **Scroll Lock / Num Lock / Caps Lock**, and **Pause**. Letter and digit keys are rejected because the hotkey listener does not consume the key — binding to `q` would fire the action every time you type `q` in any window.
+
 ### Buttons in the window
 
 | Button | What it does |

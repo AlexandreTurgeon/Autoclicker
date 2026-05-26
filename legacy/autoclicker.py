@@ -22,28 +22,29 @@ DEFAULT_WINDOW_TITLE = "Multi-Point Autoclicker"
 
 CONFIG_FILE = pathlib.Path(__file__).with_name("autoclicker.ini")
 
-MODIFIER_KEYS = {
-    keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r,
-    keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr,
-    keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r,
-    keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r,
-}
+# Only non-typing keys are safe as global hotkeys. pynput's GlobalHotKeys does not
+# suppress the key — if you bind to a letter or digit, typing it anywhere (including
+# in this app's entry fields) fires the hotkey. Restricting to specials avoids that.
+SAFE_BINDABLE_KEY_NAMES = frozenset({
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
+    "insert", "delete", "home", "end", "page_up", "page_down",
+    "print_screen", "scroll_lock", "pause", "num_lock", "caps_lock",
+    "up", "down", "left", "right",
+})
 
 
 def key_to_hotkey(key) -> str | None:
-    """Convert a pynput key event to a GlobalHotKeys notation string, or None if unbindable."""
-    if key in MODIFIER_KEYS:
-        return None
-    if isinstance(key, keyboard.Key):
-        # Named special keys: pynput uses lowercased names matching GlobalHotKeys notation.
+    """Convert a pynput key event to a GlobalHotKeys notation string, or None if not a safe binding."""
+    if isinstance(key, keyboard.Key) and key.name in SAFE_BINDABLE_KEY_NAMES:
         return f"<{key.name}>"
-    if isinstance(key, keyboard.KeyCode):
-        char = key.char
-        if not char:
-            return None
-        # GlobalHotKeys expects bare lowercase chars for printable keys.
-        return char.lower()
     return None
+
+
+def is_safe_hotkey_notation(notation: str) -> bool:
+    if not notation or not notation.startswith("<") or not notation.endswith(">"):
+        return False
+    return notation[1:-1].lower() in SAFE_BINDABLE_KEY_NAMES
 
 
 class App:
@@ -59,6 +60,10 @@ class App:
         self.default_button = tk.StringVar(value="left")
         self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL_MS))
         self.jitter_var = tk.StringVar(value=str(DEFAULT_JITTER_MS))
+        # Plain int mirrors of the Tk StringVars so the clicker thread never touches
+        # Tk state. Updated on the Tk thread by _on_timing_change.
+        self.interval_ms = DEFAULT_INTERVAL_MS
+        self.jitter_ms = DEFAULT_JITTER_MS
         self.status_var = tk.StringVar(value="IDLE")
         self.capture_hotkey = DEFAULT_CAPTURE_HOTKEY
         self.toggle_hotkey = DEFAULT_TOGGLE_HOTKEY
@@ -67,6 +72,7 @@ class App:
         self.window_title = DEFAULT_WINDOW_TITLE
         self.hotkeys: keyboard.GlobalHotKeys | None = None
         self._rebind_listener: keyboard.Listener | None = None
+        self._rebind_in_progress = False
         self._loading_config = False
 
         self._build_ui()
@@ -167,14 +173,25 @@ class App:
         self._save_config()
 
     def _on_capture_hotkey(self):
+        # Runs on the pynput listener thread. Sample the cursor here (pynput is
+        # thread-safe) and marshal all Tk work to the Tk thread.
+        if self._rebind_in_progress:
+            return
         x, y = self.mouse.position
+        self.root.after(0, lambda: self._capture_point(int(x), int(y)))
+
+    def _capture_point(self, x: int, y: int):
         btn = self.default_button.get()
         with self.points_lock:
-            self.points.append({"x": int(x), "y": int(y), "button": btn})
-        self.root.after(0, self._refresh_tree)
+            self.points.append({"x": x, "y": y, "button": btn})
+        self._refresh_tree()
         self._save_config()
 
     def _on_toggle_hotkey(self):
+        # Runs on the pynput listener thread. Only touch threading.Event +
+        # points_lock here; route Tk updates via root.after.
+        if self._rebind_in_progress:
+            return
         if self.running.is_set():
             self.running.clear()
             self.root.after(0, lambda: self.status_var.set("IDLE"))
@@ -188,9 +205,10 @@ class App:
         self.root.after(0, lambda: self.status_var.set("RUNNING"))
 
     def _on_timing_change(self):
+        # Runs on the Tk thread (trace_add callback). Push valid values into the
+        # int mirrors so the clicker thread never reads from Tk.
         if self._loading_config:
             return
-        # Only persist when both values parse as non-negative ints.
         try:
             iv = int(self.interval_var.get())
             jv = int(self.jitter_var.get())
@@ -198,25 +216,9 @@ class App:
             return
         if iv < 0 or jv < 0:
             return
+        self.interval_ms = iv
+        self.jitter_ms = jv
         self._save_config()
-
-    def _read_interval_seconds(self) -> float:
-        try:
-            v = int(self.interval_var.get())
-            if v < 0:
-                v = 0
-        except (ValueError, TypeError):
-            v = DEFAULT_INTERVAL_MS
-        return v / 1000.0
-
-    def _read_jitter_seconds(self) -> float:
-        try:
-            v = int(self.jitter_var.get())
-            if v < 0:
-                v = 0
-        except (ValueError, TypeError):
-            v = DEFAULT_JITTER_MS
-        return v / 1000.0
 
     def _clicker_loop(self):
         while not self.stop_app.is_set():
@@ -227,8 +229,9 @@ class App:
             if not cycle:
                 self.running.clear()
                 continue
-            base = self._read_interval_seconds()
-            jitter = self._read_jitter_seconds()
+            # Snapshot the int mirrors; safe to read from any thread.
+            base = max(0, self.interval_ms) / 1000.0
+            jitter = max(0, self.jitter_ms) / 1000.0
             for p in cycle:
                 if not self.running.is_set() or self.stop_app.is_set():
                     break
@@ -250,30 +253,37 @@ class App:
     # --- Hotkey management ---------------------------------------------------
 
     def _apply_hotkeys(self):
-        if self.hotkeys is not None:
-            try:
-                self.hotkeys.stop()
-            except Exception:
-                pass
-            self.hotkeys = None
+        # Start the new listener BEFORE stopping the old one so we never have a
+        # window with no hotkeys active, and we know registration succeeded
+        # before tearing down what was working.
+        old = self.hotkeys
         try:
-            self.hotkeys = keyboard.GlobalHotKeys({
+            new = keyboard.GlobalHotKeys({
                 self.capture_hotkey: self._on_capture_hotkey,
                 self.toggle_hotkey: self._on_toggle_hotkey,
             })
-            self.hotkeys.start()
-            return True
+            new.start()
         except Exception as e:
             self.status_var.set(f"IDLE — hotkey registration failed: {e}")
             return False
+        self.hotkeys = new
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+        return True
 
     def _update_hotkey_labels(self):
         self.capture_label_var.set(self.capture_hotkey)
         self.toggle_label_var.set(self.toggle_hotkey)
 
     def _rebind(self, which: str):
-        if self._rebind_listener is not None:
-            return  # already waiting for a key
+        if self._rebind_listener is not None or self._rebind_in_progress:
+            return
+        self._rebind_in_progress = True
+        # Stop the global hotkey listener so the captured key doesn't double-fire
+        # as both a rebind target and a normal action.
         if self.hotkeys is not None:
             try:
                 self.hotkeys.stop()
@@ -291,34 +301,36 @@ class App:
 
     def _handle_rebind_key(self, which: str, key):
         self._rebind_listener = None
-        if key == keyboard.Key.esc:
-            self.status_var.set("IDLE")
-            self._apply_hotkeys()
-            return
-        notation = key_to_hotkey(key)
-        if notation is None:
-            self.status_var.set("IDLE — that key can't be bound, try another")
-            self._apply_hotkeys()
-            return
-        other = self.toggle_hotkey if which == "capture" else self.capture_hotkey
-        if notation == other:
-            self.status_var.set(f"IDLE — {notation} already bound to other action")
-            self._apply_hotkeys()
-            return
-        prev_capture, prev_toggle = self.capture_hotkey, self.toggle_hotkey
-        if which == "capture":
-            self.capture_hotkey = notation
-        else:
-            self.toggle_hotkey = notation
-        if not self._apply_hotkeys():
-            # Roll back on failure.
-            self.capture_hotkey, self.toggle_hotkey = prev_capture, prev_toggle
-            self._apply_hotkeys()
+        try:
+            if key == keyboard.Key.esc:
+                self.status_var.set("IDLE")
+                self._apply_hotkeys()
+                return
+            notation = key_to_hotkey(key)
+            if notation is None:
+                self.status_var.set("IDLE — only F1-F24, arrows, Insert/Delete/Home/End, Page Up/Down, Print Screen, Scroll/Num/Caps Lock, and Pause are bindable")
+                self._apply_hotkeys()
+                return
+            other = self.toggle_hotkey if which == "capture" else self.capture_hotkey
+            if notation == other:
+                self.status_var.set(f"IDLE — {notation} already bound to other action")
+                self._apply_hotkeys()
+                return
+            prev_capture, prev_toggle = self.capture_hotkey, self.toggle_hotkey
+            if which == "capture":
+                self.capture_hotkey = notation
+            else:
+                self.toggle_hotkey = notation
+            if not self._apply_hotkeys():
+                self.capture_hotkey, self.toggle_hotkey = prev_capture, prev_toggle
+                self._apply_hotkeys()
+                self._update_hotkey_labels()
+                return
             self._update_hotkey_labels()
-            return
-        self._update_hotkey_labels()
-        self.status_var.set("IDLE")
-        self._save_config()
+            self.status_var.set("IDLE")
+            self._save_config()
+        finally:
+            self._rebind_in_progress = False
 
     # --- Config persistence --------------------------------------------------
 
@@ -333,17 +345,24 @@ class App:
 
         cap = cp.get("hotkeys", "capture", fallback=DEFAULT_CAPTURE_HOTKEY).strip()
         tog = cp.get("hotkeys", "toggle", fallback=DEFAULT_TOGGLE_HOTKEY).strip()
-        if cap:
+        # Reject bad notations (e.g. a leftover single-char binding from an
+        # older version) so the app boots into a known-good state.
+        if is_safe_hotkey_notation(cap):
             self.capture_hotkey = cap
-        if tog:
+        if is_safe_hotkey_notation(tog):
             self.toggle_hotkey = tog
+        if self.capture_hotkey == self.toggle_hotkey:
+            self.capture_hotkey = DEFAULT_CAPTURE_HOTKEY
+            self.toggle_hotkey = DEFAULT_TOGGLE_HOTKEY
 
         iv = cp.get("timing", "interval_ms", fallback=str(DEFAULT_INTERVAL_MS)).strip()
         jv = cp.get("timing", "jitter_ms", fallback=str(DEFAULT_JITTER_MS)).strip()
         if iv.isdigit():
             self.interval_var.set(iv)
+            self.interval_ms = int(iv)
         if jv.isdigit():
             self.jitter_var.set(jv)
+            self.jitter_ms = int(jv)
 
         title = cp.get("identity", "window_title", fallback=DEFAULT_WINDOW_TITLE).strip()
         if title:
