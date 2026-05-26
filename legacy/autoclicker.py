@@ -248,7 +248,7 @@ class App:
                     while time.monotonic() < end:
                         if not self.running.is_set() or self.stop_app.is_set():
                             break
-                        time.sleep(min(0.01, end - time.monotonic()))
+                        time.sleep(max(0.0, min(0.01, end - time.monotonic())))
 
     # --- Hotkey management ---------------------------------------------------
 
