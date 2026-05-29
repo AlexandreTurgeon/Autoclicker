@@ -13,10 +13,24 @@ ToggleHotkey := "F8"
 CurrentCaptureKey := ""
 CurrentToggleKey := ""
 
+WindowTitle := "Multi-Point Autoclicker"
+InputLevel := 0
+UseHook := true
+StartWithWindows := false
+StartMinimized := false
+
+RunValueName := "Autoclicker"
+RunKey := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+
 ConfigFile := A_ScriptDir "\autoclicker.ini"
 LoadingConfig := false
 
-MyGui := Gui("+Resize", "Multi-Point Autoclicker")
+for arg in A_Args {
+    if (arg = "--minimized")
+        StartMinimized := true
+}
+
+MyGui := Gui("+Resize", WindowTitle)
 MyGui.MarginX := 10
 MyGui.MarginY := 10
 MyGui.SetFont("s10")
@@ -39,7 +53,7 @@ JitterEdit.OnEvent("Change", (*) => OnTimingChanged())
 MyGui.Add("Text", "x+12 yp+3", "Capture as:")
 BtnDD := MyGui.Add("DropDownList", "x+6 yp-3 w80 Choose1", ["Left", "Right", "Middle"])
 
-LV := MyGui.Add("ListView", "xm y+12 w500 h240", ["#", "X", "Y", "Button"])
+LV := MyGui.Add("ListView", "xm y+12 w500 h220", ["#", "X", "Y", "Button"])
 LV.ModifyCol(1, 40, "Center")
 LV.ModifyCol(2, 100, "Center")
 LV.ModifyCol(3, 100, "Center")
@@ -48,12 +62,34 @@ LV.ModifyCol(4, 100, "Center")
 MyGui.Add("Button", "xm y+10 w130", "Remove selected").OnEvent("Click", RemoveSelected)
 MyGui.Add("Button", "x+6 w110", "Clear all").OnEvent("Click", ClearAll)
 MyGui.Add("Button", "x+6 w160", "Cycle button on selected").OnEvent("Click", CycleBtn)
+MyGui.Add("Button", "x+6 w70", "Exit").OnEvent("Click", (*) => ExitApp())
 
-MyGui.OnEvent("Close", (*) => ExitApp())
+MyGui.Add("Text", "xm y+14", "Input level:")
+InputLevelEdit := MyGui.Add("Edit", "x+6 yp-3 w50 Number", "0")
+InputLevelEdit.OnEvent("Change", (*) => OnHotkeyOptionsChanged())
+UseHookCb := MyGui.Add("Checkbox", "x+12 yp+3 Checked", "Use keyboard hook ($)")
+UseHookCb.OnEvent("Click", (*) => OnHotkeyOptionsChanged())
+StartupCb := MyGui.Add("Checkbox", "x+20 yp", "Start with Windows")
+StartupCb.OnEvent("Click", (*) => OnStartupToggled())
+
+MyGui.OnEvent("Close", (*) => MyGui.Hide())
+
+A_TrayMenu.Delete()
+A_TrayMenu.Add("Show", (*) => ShowGui())
+A_TrayMenu.Add()
+A_TrayMenu.Add("Start/Stop clicking", (*) => ToggleRunning())
+A_TrayMenu.Add()
+A_TrayMenu.Add("Start with Windows", (*) => OnStartupToggledFromTray())
+A_TrayMenu.Add()
+A_TrayMenu.Add("Exit", (*) => ExitApp())
+A_TrayMenu.Default := "Show"
+A_TrayMenu.ClickCount := 1
 
 LoadConfig()
 ApplyHotkeys()
-MyGui.Show("w520 h460")
+UpdateStartupUI()
+if !StartMinimized
+    MyGui.Show("w520 h490")
 
 CapturePoint() {
     global Points, LV
@@ -62,6 +98,11 @@ CapturePoint() {
     Points.Push({ x: x, y: y, btn: btn })
     LV.Add(, Points.Length, x, y, btn)
     SaveConfig()
+}
+
+ShowGui() {
+    global MyGui
+    MyGui.Show("w520 h490")
 }
 
 ToggleRunning() {
@@ -176,8 +217,84 @@ OnTimingChanged() {
     SaveConfig()
 }
 
+OnHotkeyOptionsChanged() {
+    global InputLevel, UseHook, LoadingConfig, InputLevelEdit, UseHookCb, StatusTxt
+    if LoadingConfig
+        return
+    val := Trim(InputLevelEdit.Value)
+    if !IsInteger(val) || (val + 0) < 0 || (val + 0) > 100 {
+        StatusTxt.Value := "IDLE " Chr(0x2014) " input level must be 0-100"
+        return
+    }
+    InputLevel := val + 0
+    UseHook := UseHookCb.Value ? true : false
+    SaveConfig()
+    ApplyHotkeys()
+}
+
+OnStartupToggled() {
+    global StartWithWindows, StartupCb, LoadingConfig
+    if LoadingConfig
+        return
+    StartWithWindows := StartupCb.Value ? true : false
+    ApplyStartWithWindows()
+    SaveConfig()
+    UpdateTrayStartupCheck()
+}
+
+OnStartupToggledFromTray() {
+    global StartWithWindows, StartupCb, LoadingConfig
+    StartWithWindows := !StartWithWindows
+    LoadingConfig := true
+    StartupCb.Value := StartWithWindows ? 1 : 0
+    LoadingConfig := false
+    ApplyStartWithWindows()
+    SaveConfig()
+    UpdateTrayStartupCheck()
+}
+
+UpdateTrayStartupCheck() {
+    global StartWithWindows
+    if StartWithWindows
+        A_TrayMenu.Check("Start with Windows")
+    else
+        A_TrayMenu.Uncheck("Start with Windows")
+}
+
+UpdateStartupUI() {
+    global StartWithWindows, StartupCb, LoadingConfig
+    LoadingConfig := true
+    StartupCb.Value := StartWithWindows ? 1 : 0
+    LoadingConfig := false
+    UpdateTrayStartupCheck()
+}
+
+ApplyStartWithWindows() {
+    global StartWithWindows, RunValueName, RunKey, StatusTxt
+    if StartWithWindows {
+        if A_IsCompiled
+            cmd := '"' A_ScriptFullPath '" --minimized'
+        else
+            cmd := '"' A_AhkPath '" "' A_ScriptFullPath '" --minimized'
+        try {
+            RegWrite cmd, "REG_SZ", RunKey, RunValueName
+        } catch as e {
+            StatusTxt.Value := "IDLE " Chr(0x2014) " failed to write Run key: " e.Message
+        }
+    } else {
+        try RegDelete RunKey, RunValueName
+    }
+}
+
+BuildHotkeyName(key) {
+    global UseHook
+    if (UseHook && SubStr(key, 1, 1) != "$")
+        return "$" key
+    return key
+}
+
 ApplyHotkeys() {
-    global CaptureHotkey, ToggleHotkey, CurrentCaptureKey, CurrentToggleKey, StatusTxt
+    global CaptureHotkey, ToggleHotkey, CurrentCaptureKey, CurrentToggleKey, InputLevel, StatusTxt
     warn := ""
 
     if (CurrentCaptureKey != "") {
@@ -189,27 +306,33 @@ ApplyHotkeys() {
         CurrentToggleKey := ""
     }
 
+    opts := "On I" InputLevel
+
+    captureName := BuildHotkeyName(CaptureHotkey)
     try {
-        Hotkey CaptureHotkey, (*) => CapturePoint(), "On"
-        CurrentCaptureKey := CaptureHotkey
+        Hotkey captureName, (*) => CapturePoint(), opts
+        CurrentCaptureKey := captureName
     } catch {
         warn := "capture hotkey '" CaptureHotkey "' invalid, using F6"
         CaptureHotkey := "F6"
+        captureName := BuildHotkeyName(CaptureHotkey)
         try {
-            Hotkey CaptureHotkey, (*) => CapturePoint(), "On"
-            CurrentCaptureKey := CaptureHotkey
+            Hotkey captureName, (*) => CapturePoint(), opts
+            CurrentCaptureKey := captureName
         }
     }
 
+    toggleName := BuildHotkeyName(ToggleHotkey)
     try {
-        Hotkey ToggleHotkey, (*) => ToggleRunning(), "On"
-        CurrentToggleKey := ToggleHotkey
+        Hotkey toggleName, (*) => ToggleRunning(), opts
+        CurrentToggleKey := toggleName
     } catch {
         warn := (warn = "" ? "" : warn ", ") "toggle hotkey '" ToggleHotkey "' invalid, using F8"
         ToggleHotkey := "F8"
+        toggleName := BuildHotkeyName(ToggleHotkey)
         try {
-            Hotkey ToggleHotkey, (*) => ToggleRunning(), "On"
-            CurrentToggleKey := ToggleHotkey
+            Hotkey toggleName, (*) => ToggleRunning(), opts
+            CurrentToggleKey := toggleName
         }
     }
 
@@ -262,6 +385,7 @@ RebindKey(which) {
 
 LoadConfig() {
     global ConfigFile, CaptureHotkey, ToggleHotkey, IntervalEdit, JitterEdit, Points, LoadingConfig
+    global WindowTitle, MyGui, InputLevel, UseHook, StartWithWindows, InputLevelEdit, UseHookCb
     if !FileExist(ConfigFile)
         return
     LoadingConfig := true
@@ -273,6 +397,25 @@ LoadConfig() {
         IntervalEdit.Value := intVal
     if IsInteger(jitVal) && (jitVal + 0) >= 0
         JitterEdit.Value := jitVal
+
+    title := IniRead(ConfigFile, "identity", "window_title", "Multi-Point Autoclicker")
+    if (title != "") {
+        WindowTitle := title
+        MyGui.Title := title
+    }
+
+    lvlVal := IniRead(ConfigFile, "hotkeys", "input_level", "0")
+    if IsInteger(lvlVal) && (lvlVal + 0) >= 0 && (lvlVal + 0) <= 100 {
+        InputLevel := lvlVal + 0
+        InputLevelEdit.Value := InputLevel
+    }
+    hookVal := IniRead(ConfigFile, "hotkeys", "use_hook", "1")
+    UseHook := (hookVal = "1") ? true : false
+    UseHookCb.Value := UseHook ? 1 : 0
+
+    startVal := IniRead(ConfigFile, "startup", "enabled", "0")
+    StartWithWindows := (startVal = "1") ? true : false
+
     count := IniRead(ConfigFile, "points", "count", "0")
     if !IsInteger(count) || (count + 0) <= 0 {
         LoadingConfig := false
@@ -301,6 +444,7 @@ LoadConfig() {
 
 SaveConfig() {
     global ConfigFile, CaptureHotkey, ToggleHotkey, IntervalEdit, JitterEdit, Points, LoadingConfig
+    global WindowTitle, InputLevel, UseHook, StartWithWindows
     if LoadingConfig
         return
     try {
@@ -308,6 +452,10 @@ SaveConfig() {
         IniWrite ToggleHotkey, ConfigFile, "hotkeys", "toggle"
         IniWrite IntervalEdit.Value, ConfigFile, "timing", "interval_ms"
         IniWrite JitterEdit.Value, ConfigFile, "timing", "jitter_ms"
+        IniWrite WindowTitle, ConfigFile, "identity", "window_title"
+        IniWrite InputLevel, ConfigFile, "hotkeys", "input_level"
+        IniWrite (UseHook ? "1" : "0"), ConfigFile, "hotkeys", "use_hook"
+        IniWrite (StartWithWindows ? "1" : "0"), ConfigFile, "startup", "enabled"
         try IniDelete ConfigFile, "points"
         IniWrite Points.Length, ConfigFile, "points", "count"
         for i, p in Points
