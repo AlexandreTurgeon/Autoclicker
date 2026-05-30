@@ -50,6 +50,7 @@ Close the window to quit. Your points, interval, jitter, and hotkey bindings are
 1. **Pick a mouse button** next to "Capture as:" (Left / Right / Middle). New points you capture will use this button. You can change it again before capturing the next point.
 2. **Set the interval** (milliseconds between clicks). Default `50`. For testing, try `500` so you can actually see the cursor jumping around.
 3. *(Optional)* **Set jitter ± (ms)** — randomizes the wait between clicks by up to ± that many milliseconds. Default `0` (uniform). Useful when a perfectly regular cadence is undesirable.
+   *(Optional)* **Set position jitter ± (px)** — randomly offsets each click by up to ± that many pixels in both X and Y around the captured point. Default `0` (clicks land exactly on the point). Useful when clicking the exact same pixel every time is undesirable.
 4. **Capture click points** — move your mouse to a target spot anywhere on screen (any window, any monitor) and press the capture hotkey (default **F6**). A row is added to the table with the X/Y coordinates. Repeat for as many spots as you want.
 5. **Start clicking** — press the toggle hotkey (default **F8**). Status flips to `RUNNING`. The cursor will jump to each point and click it, looping forever.
 6. **Stop** — press the toggle hotkey again. Status returns to `IDLE`. Stop is almost instant — it checks between every click.
@@ -78,7 +79,7 @@ Only non-typing keys are bindable: **F1–F24**, arrow keys, **Insert / Delete /
 
 ## Config file
 
-State is saved to `autoclicker.ini` next to the script. It is rewritten whenever you capture/remove/clear a point, change the interval or jitter, or rebind a hotkey.
+State is saved to `autoclicker.ini` next to the script. It is rewritten whenever you capture/remove/clear a point, change the interval, jitter, or position jitter, or rebind a hotkey.
 
 ```ini
 [hotkeys]
@@ -88,6 +89,7 @@ toggle = <f8>
 [timing]
 interval_ms = 50
 jitter_ms = 0
+pos_jitter_px = 0
 
 [identity]
 window_title = Multi-Point Autoclicker

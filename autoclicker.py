@@ -16,6 +16,7 @@ BUTTON_OBJ = {
 }
 DEFAULT_INTERVAL_MS = 50
 DEFAULT_JITTER_MS = 0
+DEFAULT_POS_JITTER_PX = 0
 DEFAULT_CAPTURE_HOTKEY = "<f6>"
 DEFAULT_TOGGLE_HOTKEY = "<f8>"
 DEFAULT_WINDOW_TITLE = "Multi-Point Autoclicker"
@@ -50,7 +51,7 @@ def is_safe_hotkey_notation(notation: str) -> bool:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.geometry("520x460")
+        self.root.geometry("520x500")
 
         self.points: list[dict] = []
         self.points_lock = threading.Lock()
@@ -60,10 +61,12 @@ class App:
         self.default_button = tk.StringVar(value="left")
         self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL_MS))
         self.jitter_var = tk.StringVar(value=str(DEFAULT_JITTER_MS))
+        self.pos_jitter_var = tk.StringVar(value=str(DEFAULT_POS_JITTER_PX))
         # Plain int mirrors of the Tk StringVars so the clicker thread never touches
         # Tk state. Updated on the Tk thread by _on_timing_change.
         self.interval_ms = DEFAULT_INTERVAL_MS
         self.jitter_ms = DEFAULT_JITTER_MS
+        self.pos_jitter_px = DEFAULT_POS_JITTER_PX
         self.status_var = tk.StringVar(value="IDLE")
         self.capture_hotkey = DEFAULT_CAPTURE_HOTKEY
         self.toggle_hotkey = DEFAULT_TOGGLE_HOTKEY
@@ -88,6 +91,7 @@ class App:
         # Wire change-tracking AFTER initial load so trace_add doesn't fire during load.
         self.interval_var.trace_add("write", lambda *_: self._on_timing_change())
         self.jitter_var.trace_add("write", lambda *_: self._on_timing_change())
+        self.pos_jitter_var.trace_add("write", lambda *_: self._on_timing_change())
 
         self.clicker_thread = threading.Thread(target=self._clicker_loop, daemon=True)
         self.clicker_thread.start()
@@ -121,6 +125,11 @@ class App:
         ttk.Label(cfg, text="Capture as:").pack(side="left")
         for b in BUTTONS:
             ttk.Radiobutton(cfg, text=b, value=b, variable=self.default_button).pack(side="left")
+
+        cfg2 = ttk.Frame(self.root)
+        cfg2.pack(fill="x", **pad)
+        ttk.Label(cfg2, text="Position jitter ± (px):").pack(side="left")
+        ttk.Entry(cfg2, textvariable=self.pos_jitter_var, width=8).pack(side="left", padx=(4, 12))
 
         cols = ("idx", "x", "y", "button")
         self.tree = ttk.Treeview(self.root, columns=cols, show="headings", height=10)
@@ -212,12 +221,14 @@ class App:
         try:
             iv = int(self.interval_var.get())
             jv = int(self.jitter_var.get())
+            pj = int(self.pos_jitter_var.get())
         except (ValueError, TypeError):
             return
-        if iv < 0 or jv < 0:
+        if iv < 0 or jv < 0 or pj < 0:
             return
         self.interval_ms = iv
         self.jitter_ms = jv
+        self.pos_jitter_px = pj
         self._save_config()
 
     def _clicker_loop(self):
@@ -232,11 +243,16 @@ class App:
             # Snapshot the int mirrors; safe to read from any thread.
             base = max(0, self.interval_ms) / 1000.0
             jitter = max(0, self.jitter_ms) / 1000.0
+            pos_jitter = max(0, self.pos_jitter_px)
             for p in cycle:
                 if not self.running.is_set() or self.stop_app.is_set():
                     break
                 try:
-                    self.mouse.position = (p["x"], p["y"])
+                    x, y = p["x"], p["y"]
+                    if pos_jitter > 0:
+                        x += random.randint(-pos_jitter, pos_jitter)
+                        y += random.randint(-pos_jitter, pos_jitter)
+                    self.mouse.position = (x, y)
                     self.mouse.click(BUTTON_OBJ[p["button"]], 1)
                 except Exception:
                     pass
@@ -357,12 +373,16 @@ class App:
 
         iv = cp.get("timing", "interval_ms", fallback=str(DEFAULT_INTERVAL_MS)).strip()
         jv = cp.get("timing", "jitter_ms", fallback=str(DEFAULT_JITTER_MS)).strip()
+        pj = cp.get("timing", "pos_jitter_px", fallback=str(DEFAULT_POS_JITTER_PX)).strip()
         if iv.isdigit():
             self.interval_var.set(iv)
             self.interval_ms = int(iv)
         if jv.isdigit():
             self.jitter_var.set(jv)
             self.jitter_ms = int(jv)
+        if pj.isdigit():
+            self.pos_jitter_var.set(pj)
+            self.pos_jitter_px = int(pj)
 
         title = cp.get("identity", "window_title", fallback=DEFAULT_WINDOW_TITLE).strip()
         if title:
@@ -404,6 +424,7 @@ class App:
         cp["timing"] = {
             "interval_ms": self.interval_var.get().strip() or str(DEFAULT_INTERVAL_MS),
             "jitter_ms": self.jitter_var.get().strip() or str(DEFAULT_JITTER_MS),
+            "pos_jitter_px": self.pos_jitter_var.get().strip() or str(DEFAULT_POS_JITTER_PX),
         }
         cp["identity"] = {"window_title": self.window_title}
         with self.points_lock:
