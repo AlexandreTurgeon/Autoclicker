@@ -17,6 +17,9 @@ BUTTON_OBJ = {
 DEFAULT_INTERVAL_MS = 50
 DEFAULT_JITTER_MS = 0
 DEFAULT_POS_JITTER_PX = 0
+DEFAULT_LIMIT_COUNT = 0          # 0 = unlimited
+DEFAULT_LIMIT_UNIT = "clicks"
+LIMIT_UNITS = ("clicks", "cycles")
 DEFAULT_CAPTURE_HOTKEY = "<f6>"
 DEFAULT_TOGGLE_HOTKEY = "<f8>"
 DEFAULT_WINDOW_TITLE = "Multi-Point Autoclicker"
@@ -51,7 +54,7 @@ def is_safe_hotkey_notation(notation: str) -> bool:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.geometry("520x500")
+        self.root.geometry("520x540")
 
         self.points: list[dict] = []
         self.points_lock = threading.Lock()
@@ -62,11 +65,19 @@ class App:
         self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL_MS))
         self.jitter_var = tk.StringVar(value=str(DEFAULT_JITTER_MS))
         self.pos_jitter_var = tk.StringVar(value=str(DEFAULT_POS_JITTER_PX))
+        self.limit_var = tk.StringVar(value=str(DEFAULT_LIMIT_COUNT))
+        self.limit_unit = tk.StringVar(value=DEFAULT_LIMIT_UNIT)
         # Plain int mirrors of the Tk StringVars so the clicker thread never touches
-        # Tk state. Updated on the Tk thread by _on_timing_change.
+        # Tk state. Updated on the Tk thread by _on_timing_change / _on_limit_change.
         self.interval_ms = DEFAULT_INTERVAL_MS
         self.jitter_ms = DEFAULT_JITTER_MS
         self.pos_jitter_px = DEFAULT_POS_JITTER_PX
+        self.limit_count = DEFAULT_LIMIT_COUNT
+        self.limit_unit_val = DEFAULT_LIMIT_UNIT
+        # Live counters for the current run; written only by the clicker thread.
+        self.click_count = 0
+        self.cycle_count = 0
+        self.count_var = tk.StringVar(value="Clicks: 0   Cycles: 0")
         self.status_var = tk.StringVar(value="IDLE")
         self.capture_hotkey = DEFAULT_CAPTURE_HOTKEY
         self.toggle_hotkey = DEFAULT_TOGGLE_HOTKEY
@@ -92,6 +103,8 @@ class App:
         self.interval_var.trace_add("write", lambda *_: self._on_timing_change())
         self.jitter_var.trace_add("write", lambda *_: self._on_timing_change())
         self.pos_jitter_var.trace_add("write", lambda *_: self._on_timing_change())
+        self.limit_var.trace_add("write", lambda *_: self._on_limit_change())
+        self.limit_unit.trace_add("write", lambda *_: self._on_limit_change())
 
         self.clicker_thread = threading.Thread(target=self._clicker_loop, daemon=True)
         self.clicker_thread.start()
@@ -106,6 +119,7 @@ class App:
         top = ttk.Frame(self.root)
         top.pack(fill="x", **pad)
         ttk.Label(top, textvariable=self.status_var, font=("Segoe UI", 14, "bold")).pack(side="left")
+        ttk.Label(top, textvariable=self.count_var).pack(side="right")
 
         hk = ttk.Frame(self.root)
         hk.pack(fill="x", **pad)
@@ -130,6 +144,14 @@ class App:
         cfg2.pack(fill="x", **pad)
         ttk.Label(cfg2, text="Position jitter ± (px):").pack(side="left")
         ttk.Entry(cfg2, textvariable=self.pos_jitter_var, width=8).pack(side="left", padx=(4, 12))
+
+        cfg3 = ttk.Frame(self.root)
+        cfg3.pack(fill="x", **pad)
+        ttk.Label(cfg3, text="Stop after:").pack(side="left")
+        ttk.Entry(cfg3, textvariable=self.limit_var, width=8).pack(side="left", padx=(4, 4))
+        for u in LIMIT_UNITS:
+            ttk.Radiobutton(cfg3, text=u, value=u, variable=self.limit_unit).pack(side="left")
+        ttk.Label(cfg3, text="(0 = unlimited)").pack(side="left", padx=(8, 0))
 
         cols = ("idx", "x", "y", "button")
         self.tree = ttk.Treeview(self.root, columns=cols, show="headings", height=10)
@@ -204,12 +226,16 @@ class App:
         if self.running.is_set():
             self.running.clear()
             self.root.after(0, lambda: self.status_var.set("IDLE"))
+            self.root.after(0, self._flush_count)
             return
         with self.points_lock:
             has_points = bool(self.points)
         if not has_points:
             self.root.after(0, lambda: self.status_var.set("IDLE — no points configured"))
             return
+        self.click_count = 0
+        self.cycle_count = 0
+        self.root.after(0, self._flush_count)
         self.running.set()
         self.root.after(0, lambda: self.status_var.set("RUNNING"))
 
@@ -231,7 +257,33 @@ class App:
         self.pos_jitter_px = pj
         self._save_config()
 
+    def _on_limit_change(self):
+        # Runs on the Tk thread. Kept separate from _on_timing_change so a bad
+        # interval/jitter value doesn't block updating the click limit.
+        if self._loading_config:
+            return
+        raw = self.limit_var.get().strip()
+        if raw == "":
+            self.limit_count = 0
+        elif raw.isdigit():
+            self.limit_count = int(raw)
+        else:
+            return
+        self.limit_unit_val = self.limit_unit.get()
+        self._save_config()
+
+    def _flush_count(self):
+        self.count_var.set(f"Clicks: {self.click_count}   Cycles: {self.cycle_count}")
+
+    def _stop_from_limit(self):
+        # Called on the clicker thread when a limit is reached.
+        self.running.clear()
+        c = self.click_count
+        self.root.after(0, lambda: self.status_var.set(f"IDLE — reached {c} clicks"))
+        self.root.after(0, self._flush_count)
+
     def _clicker_loop(self):
+        last_ui = time.monotonic()
         while not self.stop_app.is_set():
             if not self.running.wait(timeout=0.1):
                 continue
@@ -244,6 +296,8 @@ class App:
             base = max(0, self.interval_ms) / 1000.0
             jitter = max(0, self.jitter_ms) / 1000.0
             pos_jitter = max(0, self.pos_jitter_px)
+            limit = max(0, self.limit_count)
+            unit = self.limit_unit_val
             for p in cycle:
                 if not self.running.is_set() or self.stop_app.is_set():
                     break
@@ -256,6 +310,18 @@ class App:
                     self.mouse.click(BUTTON_OBJ[p["button"]], 1)
                 except Exception:
                     pass
+                self.click_count += 1
+                if limit > 0 and unit == "clicks" and self.click_count >= limit:
+                    self._stop_from_limit()
+                    break
+                # Throttle display updates to ~4/sec so a fast interval doesn't
+                # flood the Tk event queue with one root.after per click.
+                now = time.monotonic()
+                if now - last_ui >= 0.25:
+                    last_ui = now
+                    c, cy = self.click_count, self.cycle_count
+                    self.root.after(0, lambda c=c, cy=cy:
+                        self.count_var.set(f"Clicks: {c}   Cycles: {cy}"))
                 delay = base
                 if jitter > 0:
                     delay = max(0.0, base + random.uniform(-jitter, jitter))
@@ -265,6 +331,11 @@ class App:
                         if not self.running.is_set() or self.stop_app.is_set():
                             break
                         time.sleep(max(0.0, min(0.01, end - time.monotonic())))
+            # Count a full pass only if the cycle completed without interruption.
+            if self.running.is_set():
+                self.cycle_count += 1
+                if limit > 0 and unit == "cycles" and self.cycle_count >= limit:
+                    self._stop_from_limit()
 
     # --- Hotkey management ---------------------------------------------------
 
@@ -356,7 +427,10 @@ class App:
         cp = configparser.ConfigParser(interpolation=None)
         try:
             cp.read(CONFIG_FILE, encoding="utf-8")
-        except (configparser.Error, OSError):
+        except (configparser.Error, OSError, UnicodeDecodeError):
+            # A non-UTF-8 file (e.g. a stale UTF-16 ini from an older build) would
+            # otherwise crash startup; fall back to defaults and let the next save
+            # rewrite it as UTF-8.
             return
 
         cap = cp.get("hotkeys", "capture", fallback=DEFAULT_CAPTURE_HOTKEY).strip()
@@ -383,6 +457,15 @@ class App:
         if pj.isdigit():
             self.pos_jitter_var.set(pj)
             self.pos_jitter_px = int(pj)
+
+        lc = cp.get("timing", "limit_count", fallback=str(DEFAULT_LIMIT_COUNT)).strip()
+        lu = cp.get("timing", "limit_unit", fallback=DEFAULT_LIMIT_UNIT).strip().lower()
+        if lc.isdigit():
+            self.limit_var.set(lc)
+            self.limit_count = int(lc)
+        if lu in LIMIT_UNITS:
+            self.limit_unit.set(lu)
+            self.limit_unit_val = lu
 
         title = cp.get("identity", "window_title", fallback=DEFAULT_WINDOW_TITLE).strip()
         if title:
@@ -425,6 +508,8 @@ class App:
             "interval_ms": self.interval_var.get().strip() or str(DEFAULT_INTERVAL_MS),
             "jitter_ms": self.jitter_var.get().strip() or str(DEFAULT_JITTER_MS),
             "pos_jitter_px": self.pos_jitter_var.get().strip() or str(DEFAULT_POS_JITTER_PX),
+            "limit_count": self.limit_var.get().strip() or "0",
+            "limit_unit": self.limit_unit.get(),
         }
         cp["identity"] = {"window_title": self.window_title}
         with self.points_lock:
